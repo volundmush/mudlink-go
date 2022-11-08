@@ -7,21 +7,35 @@ import (
 	"time"
 )
 
+const (
+	Telnet    uint8 = 0
+	WebSocket       = 1
+)
+
+const (
+	NoColor   uint8 = 0
+	ANSI16          = 1
+	XTERM256        = 2
+	TRUECOLOR       = 3
+)
+
 type MudCapabilities struct {
-	Protocol          string
+	ClientID          string
+	Protocol          uint8
 	Address           net.Addr
 	Tls               bool
+	Client_name       string
+	Client_version    string
 	Width             uint16
 	Height            uint16
-	Ansi              bool
-	Xterm256          bool
-	Truecolor         bool
+	Color             uint8
 	Gmcp              bool
 	Msdp              bool
 	Mssp              bool
 	Mccp2             bool
+	Mccp2_active      bool
 	Mccp3             bool
-	Ttype             bool
+	Mccp3_active      bool
 	Naws              bool
 	Screen_reader     bool
 	Linemode          bool
@@ -33,23 +47,27 @@ type MudCapabilities struct {
 	Osc_color_palette bool
 	Proxy             bool
 	Mnes              bool
-	Client_name       string
-	Client_version    string
 	Terminal_type     string
 	Keepalive         bool
 	Mtts              bool
+	Mxp               bool
 }
 
+const (
+	Pending uint8 = 0
+	Running       = 1
+	Closed        = 2
+)
+
 type MudConnection interface {
-	Ready() bool
 	Start()
 	Close()
-	Name() string
 	Capabilities() *MudCapabilities
-	SendStatus(data map[string]string)
+	SendMSSP(data map[string]string)
 	SendLine(data string)
 	SendText(data string)
 	SendPrompt(data string)
+	Status() uint8
 }
 
 type MudListener interface {
@@ -75,6 +93,18 @@ type MudLinkManager struct {
 	Handler     MudConnectionHandler
 }
 
+func NewMudLinkManager(h MudConnectionHandler) (*MudLinkManager, error) {
+	if h == nil {
+		return nil, errors.New("MudLinkManager must have a valid MudConnectionHandler")
+	}
+	out := new(MudLinkManager)
+	out.Handler = h
+	out.Handler.SetManager(out)
+	out.listeners = make(map[string]MudListener)
+	out.Connections = make(map[string]MudConnection)
+	return out, nil
+}
+
 func (m *MudLinkManager) RegisterListener(l MudListener) (bool, error) {
 	n := l.Name()
 	if m.listeners[n] != nil {
@@ -86,35 +116,16 @@ func (m *MudLinkManager) RegisterListener(l MudListener) (bool, error) {
 }
 
 func (m *MudLinkManager) RegisterConnection(c MudConnection) {
-	n := c.Name()
-	m.Connections[n] = c
+	m.Connections[c.Capabilities().ClientID] = c
 	go c.Start()
 }
 
 func (m *MudLinkManager) GenerateConnId(prefix string, length uint) string {
-	t := time.Now().String()
-	name := prefix + "_" + t
-	return name
-}
-
-func (m *MudLinkManager) init() {
-	m.listeners = make(map[string]MudListener)
-	m.Connections = make(map[string]MudConnection)
+	return prefix + "_" + time.Now().String()
 }
 
 func (m *MudLinkManager) Start() {
 	for _, val := range m.listeners {
 		val.Start()
 	}
-}
-
-func NewMudLinkManager(h MudConnectionHandler) (*MudLinkManager, error) {
-	if h == nil {
-		return nil, errors.New("MudLinkManager must have a valid MudConnectionHandler")
-	}
-	var out MudLinkManager
-	out.init()
-	out.Handler = h
-	h.SetManager(&out)
-	return &out, nil
 }

@@ -20,7 +20,7 @@ func (h *TestHandler) OnConnect(c mudlink.MudConnection) {
 }
 
 func (h *TestHandler) OnLine(c mudlink.MudConnection, line string) {
-	fmt.Println("Connection ", c.Name(), " sent: ", line)
+	fmt.Println("Connection ", c.Capabilities().ClientID, " sent: ", line)
 }
 
 func (h *TestHandler) OnDisconnect(c mudlink.MudConnection) {

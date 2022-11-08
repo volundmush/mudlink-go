@@ -1,44 +1,43 @@
 package telnet
 
 import (
+	"bufio"
 	"bytes"
+	"compress/zlib"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"github.com/Masterminds/semver/v3"
+	"github.com/Masterminds/semver"
 	"github.com/volundmush/mudlink-go/mudlink"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
-	"time"
-	"unicode/utf8"
 )
 
 var XTERM_CLIENTS = map[string]bool{"ATLANTIS": true, "CMUD": true, "KILDCLIENT": true, "MUDLET": true, "MUSHCLIENT": true,
 	"PUTTY": true, "BEIP": true, "POTATO": true, "TINYFUGUE": true}
 
-type OpCode byte
-
 const (
-	NUL        OpCode = 0
-	BEL               = 7
-	CR                = 13
-	LF                = 10
-	SGA               = 3
-	TELOPT_EOR        = 25
-	NAWS              = 31
-	LINEMODE          = 34
-	EOR               = 239
-	SE                = 240
-	NOP               = 241
-	GA                = 249
-	SB                = 250
-	WILL              = 251
-	WONT              = 252
-	DO                = 253
-	DONT              = 254
-	IAC               = 255
+	NUL        byte = 0
+	BEL             = 7
+	CR              = 13
+	LF              = 10
+	SGA             = 3
+	TELOPT_EOR      = 25
+	NAWS            = 31
+	LINEMODE        = 34
+	EOR             = 239
+	SE              = 240
+	NOP             = 241
+	GA              = 249
+	SB              = 250
+	WILL            = 251
+	WONT            = 252
+	DO              = 253
+	DONT            = 254
+	IAC             = 255
 
 	// MNES Mud New-Environ Standard
 	MNES = 39
@@ -59,216 +58,399 @@ const (
 	// MSDP Mud Server Data Protocol
 	MSDP = 69
 
-	// TTYPE Terminal Type
-	TTYPE = 24
+	// MTTS Terminal Type
+	MTTS = 24
 )
 
-type OpHandler interface {
-	OpCode() byte
-	StartWill() bool
-	StartDo() bool
-	SupportLocal() bool
-	SupportRemote() bool
-	Init(t *TelnetMudConnection)
-	RegisterHandshakes(t *TelnetMudConnection)
-	OnLocalEnable(t *TelnetMudConnection)
-	OnRemoteEnable(t *TelnetMudConnection)
-	OnLocalDisable(t *TelnetMudConnection)
-	OnRemoteDisable(t *TelnetMudConnection)
-	SubNegotiate(t *TelnetMudConnection, data []byte)
+var Negotiators = map[byte]byte{
+	WILL: DO,
+	DO:   WILL,
+	DONT: WONT,
+	WONT: DONT,
 }
 
-type DefaultOpHandler struct{}
-
-func (h *DefaultOpHandler) OpCode() byte                                     { return 0 }
-func (h *DefaultOpHandler) StartWill() bool                                  { return false }
-func (h *DefaultOpHandler) StartDo() bool                                    { return false }
-func (h *DefaultOpHandler) SupportLocal() bool                               { return false }
-func (h *DefaultOpHandler) SupportRemote() bool                              { return false }
-func (h *DefaultOpHandler) Init(t *TelnetMudConnection)                      {}
-func (h *DefaultOpHandler) OnLocalEnable(t *TelnetMudConnection)             {}
-func (h *DefaultOpHandler) OnRemoteEnable(t *TelnetMudConnection)            {}
-func (h *DefaultOpHandler) OnLocalDisable(t *TelnetMudConnection)            {}
-func (h *DefaultOpHandler) OnRemoteDisable(t *TelnetMudConnection)           {}
-func (h *DefaultOpHandler) SubNegotiate(t *TelnetMudConnection, data []byte) {}
-func (h *DefaultOpHandler) RegisterHandshakes(t *TelnetMudConnection)        {}
-
-type NAWSHandler struct {
-	DefaultOpHandler
+var Reversed = map[byte]byte{
+	WILL: DONT,
+	DO:   WONT,
+	DONT: WONT,
+	WONT: DONT,
 }
 
-func (h *NAWSHandler) OpCode() byte        { return NAWS }
-func (h *NAWSHandler) StartDo() bool       { return true }
-func (h *NAWSHandler) SupportRemote() bool { return true }
-func (h *NAWSHandler) SubNegotiate(t *TelnetMudConnection, data []byte) {
-	if len(data) < 4 {
+func TelnetSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	available := len(data)
+
+	// If no bytes, don't bother.
+	if available < 1 {
+		return 0, nil, nil
+	}
+
+	if data[0] == IAC {
+		// Need at least 2 bytes to do anything with an IAC message.
+		if available < 2 {
+			return 0, nil, nil
+		}
+		_, ok := Negotiators[data[1]]
+		switch {
+		case data[1] == IAC:
+			// This is a literal escaped byte 255. We have to return it alone, lest further parsing confuse it with
+			// an IAC <command>
+			return 2, data[1:1], nil
+		case ok:
+			// This handles DO/DONT/WILL/WONT
+			if available < 3 {
+				return 0, nil, nil
+			}
+			return 3, data[:3], nil
+		case data[1] == SB:
+			// This pattern is IAC SB <OPCODE> <BYTES> IAC SE, it requires at least 5 bytes to make sense.
+			if available < 5 {
+				return 0, nil, nil
+			}
+			escaped := false
+			for i, c := range data[3:] {
+				if escaped {
+					if c == SE {
+						// We can finally return some data!
+						return 4 + i, data[:4+i], nil
+					}
+					escaped = false
+					continue
+				}
+				if c == IAC {
+					escaped = true
+				}
+			}
+			// if we reached this point, then we haven't received an IAC SE terminator yet.
+			return 0, nil, nil
+		default:
+			// This is an IAC <command>
+			return 2, data[:1], nil
+		}
+
+	} else {
+		// If the buffer doesn't begin with IAC, we gobble up everything up until the next IAC.
+		for i, c := range data {
+			if c == IAC {
+				return i, data[:i], nil
+			}
+		}
+		return available, data, nil
+	}
+}
+
+type TelnetPerspective struct {
+	negotiating bool
+	enabled     bool
+}
+
+type TelnetOption struct {
+	remote TelnetPerspective
+	local  TelnetPerspective
+}
+
+type TelnetStream struct {
+	reader       io.Reader
+	writer       io.WriteCloser
+	address      net.Addr
+	outchan      chan []byte
+	appdata      bytes.Buffer
+	op_sga       TelnetOption
+	op_telopteor TelnetOption
+	op_naws      TelnetOption
+	op_linemode  TelnetOption
+	op_mnes      TelnetOption
+	op_mxp       TelnetOption
+	op_mssp      TelnetOption
+	op_mccp2     TelnetOption
+	op_mccp3     TelnetOption
+	op_gmcp      TelnetOption
+	op_msdp      TelnetOption
+	op_mtts      TelnetOption
+	mccp2_active bool
+	mccp3_active bool
+	dirty        bool
+	mtts_temp    []byte
+	mtts_state   uint8
+	capabilities mudlink.MudCapabilities
+	status       uint8
+}
+
+var mccp2_sequence = []byte{IAC, SB, MCCP2, IAC, SE}
+var mccp3_sequence = []byte{IAC, SB, MCCP3, IAC, SE}
+
+var start_sequence = []byte{
+	IAC, DO, LINEMODE,
+	IAC, WILL, SGA,
+	IAC, DO, NAWS,
+	IAC, DO, MTTS,
+	IAC, WILL, MCCP2,
+	IAC, DO, MCCP3,
+	IAC, WILL, MSSP,
+	IAC, WILL, MSDP,
+	IAC, WILL, GMCP,
+	IAC, WILL, MXP,
+}
+
+func (t *TelnetStream) Start() {
+	t.outchan <- start_sequence
+	t.op_linemode.remote.negotiating = true
+	t.op_naws.remote.negotiating = true
+	t.op_mtts.remote.negotiating = true
+	t.op_mccp2.local.negotiating = true
+	t.op_mccp3.remote.negotiating = true
+	t.op_mssp.local.negotiating = true
+	t.op_msdp.local.negotiating = true
+	t.op_gmcp.local.negotiating = true
+	t.op_mxp.local.negotiating = true
+	go t.runWriter()
+	go t.runReader()
+}
+
+func (t *TelnetStream) Close() {
+	close(t.outchan)
+	t.writer.Close()
+}
+
+func (t *TelnetStream) handleAppData(p []byte) {
+	t.appdata.Write(p)
+	fmt.Println("GOT APPDATA:", string(p))
+	t.SendLine("ECHO: " + string(p))
+
+}
+
+func (t *TelnetStream) Capabilities() *mudlink.MudCapabilities {
+	return &t.capabilities
+}
+
+func (t *TelnetStream) Status() uint8 {
+	return t.status
+}
+
+func (t *TelnetStream) SendMSSP(data map[string]string) {
+	// TODO!
+}
+
+func (t *TelnetStream) SendLine(data string) {
+	if strings.HasSuffix(data, "\r\n") {
+		t.SendText(data)
+	} else {
+		t.SendText(data + "\r\n")
+	}
+}
+
+func (t *TelnetStream) SendText(data string) {
+	msg := strings.ReplaceAll(data, "\r", "")
+	msg = strings.ReplaceAll(data, "\n", "\r\n")
+	t.outchan <- []byte(msg)
+}
+
+func (t *TelnetStream) SendPrompt(data string) {
+	t.SendLine(data)
+}
+
+var local_supported = map[byte]bool{
+	MCCP2: true,
+	MSSP:  true,
+	MSDP:  true,
+	GMCP:  true,
+	MXP:   true,
+}
+
+var remote_supported = map[byte]bool{
+	LINEMODE: true,
+	NAWS:     true,
+	MTTS:     true,
+	MCCP3:    true,
+}
+
+func (t *TelnetStream) onEnableLocal(option byte) {
+	switch option {
+	case MCCP2:
+		fmt.Println("MCCP2 DETECTED")
+		t.capabilities.Mccp2 = true
+		// activate compression immediately after the writer sees this
+		t.outchan <- mccp2_sequence
+	case MSSP:
+		// TODO: send a MSSP request to the backend...
+		t.capabilities.Mssp = true
+	case MSDP:
+		t.capabilities.Msdp = true
+	case GMCP:
+		t.capabilities.Gmcp = true
+	case MXP:
+		t.capabilities.Mxp = true
+	}
+	t.dirty = true
+}
+
+func (t *TelnetStream) onEnableRemote(option byte) {
+	switch option {
+	case LINEMODE:
+		t.capabilities.Linemode = true
+	case NAWS:
+		t.capabilities.Naws = true
+	case MTTS:
+		t.capabilities.Mtts = true
+	case MCCP3:
+		t.capabilities.Mccp3 = true
+	}
+}
+
+func (t *TelnetStream) onDisableLocal(option byte) {
+
+}
+
+func (t *TelnetStream) onDisableRemote(option byte) {
+
+}
+
+func (t *TelnetStream) handleNegotiate(operation, option byte) {
+	var op *TelnetOption = nil
+	var per *TelnetPerspective = nil
+
+	var options map[byte]bool
+
+	var enabler bool
+	var local bool
+
+	switch operation {
+	case WILL:
+		fmt.Println("IAC WILL", option)
+		enabler = true
+		local = false
+	case DO:
+		fmt.Println("IAC DO", option)
+		enabler = true
+		local = true
+	case WONT:
+		fmt.Println("IAC WONT", option)
+		enabler = false
+		local = false
+	case DONT:
+		fmt.Println("IAC DONT", option)
+		enabler = false
+		local = true
+	}
+
+	if local {
+		options = local_supported
+	} else {
+		options = remote_supported
+	}
+
+	supported, ok := options[option]
+
+	if (!ok || !supported) && enabler {
+		t.outchan <- []byte{IAC, Reversed[operation], option}
 		return
 	}
-	t.capabilities.Width = binary.BigEndian.Uint16(data[:2])
-	t.capabilities.Height = binary.BigEndian.Uint16(data[2:2])
-	if t.ready {
-		t.OnUpdate()
-	}
-}
 
-func (h *NAWSHandler) OnRemoteEnable(t *TelnetMudConnection) {
-	t.capabilities.Naws = true
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-func (h *NAWSHandler) OnRemoteDisable(t *TelnetMudConnection) {
-	t.capabilities.Naws = false
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-func (h *NAWSHandler) RegisterHandshakes(t *TelnetMudConnection) {
-	t.hs.remote[NAWS] = true
-}
-
-type SGAHandler struct {
-	DefaultOpHandler
-}
-
-func (h *SGAHandler) OpCode() byte       { return SGA }
-func (h *SGAHandler) StartWill() bool    { return true }
-func (h *SGAHandler) SupportLocal() bool { return true }
-func (h *SGAHandler) OnLocalEnable(t *TelnetMudConnection) {
-	t.capabilities.Suppress_ga = true
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-func (h *SGAHandler) OnLocalDisable(t *TelnetMudConnection) {
-	t.capabilities.Suppress_ga = false
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-type MSSPHandler struct {
-	DefaultOpHandler
-}
-
-func (h *MSSPHandler) OpCode() byte       { return MSSP }
-func (h *MSSPHandler) StartWill() bool    { return true }
-func (h *MSSPHandler) SupportLocal() bool { return true }
-func (h *MSSPHandler) OnLocalEnable(t *TelnetMudConnection) {
-	t.capabilities.Mssp = true
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-func (h *MSSPHandler) OnLocalDisable(t *TelnetMudConnection) {
-	t.capabilities.Mssp = false
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-type LinemodeHandler struct {
-	DefaultOpHandler
-}
-
-func (h *LinemodeHandler) OpCode() byte        { return LINEMODE }
-func (h *LinemodeHandler) StartDo() bool       { return true }
-func (h *LinemodeHandler) SupportRemote() bool { return true }
-func (h *LinemodeHandler) OnRemoteEnable(t *TelnetMudConnection) {
-	t.capabilities.Linemode = true
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-func (h *LinemodeHandler) OnRemoteDisable(t *TelnetMudConnection) {
-	t.capabilities.Linemode = false
-	if t.ready {
-		t.OnUpdate()
-	}
-}
-
-type TTYPEHandler struct {
-	DefaultOpHandler
-	previous []byte
-	state    uint8
-}
-
-func (h *TTYPEHandler) OpCode() byte        { return TTYPE }
-func (h *TTYPEHandler) StartDo() bool       { return true }
-func (h *TTYPEHandler) SupportRemote() bool { return true }
-func (h *TTYPEHandler) RegisterHandshakes(t *TelnetMudConnection) {
-	t.hs.remote[TTYPE] = true
-	t.hs.special[0] = true
-	t.hs.special[1] = true
-	t.hs.special[2] = true
-}
-
-func (h *TTYPEHandler) OnRemoteEnable(t *TelnetMudConnection) {
-	t.outbox <- &OutMessage{data: []byte{IAC, SB, TTYPE, 1, IAC, SE}}
-}
-
-func (h *TTYPEHandler) SubNegotiate(t *TelnetMudConnection, data []byte) {
-	if h.previous == nil {
-		h.previous = make([]byte, 0)
-		h.state = 0
+	switch option {
+	case LINEMODE:
+		op = &t.op_linemode
+	case NAWS:
+		op = &t.op_naws
+	case MTTS:
+		op = &t.op_mtts
+	case MCCP3:
+		op = &t.op_mccp3
+	case MCCP2:
+		op = &t.op_mccp2
+	case MSSP:
+		op = &t.op_mssp
+	case MSDP:
+		op = &t.op_msdp
+	case GMCP:
+		op = &t.op_gmcp
+	case MXP:
+		op = &t.op_mxp
 	}
 
-	if bytes.Compare(h.previous, data) == 0 {
-		// We're not going to learn anything new by asking this again.
-		t.hs.special = make(map[byte]bool)
-		if !t.ready {
-			t.CheckReady()
+	if op == nil {
+		t.outchan <- []byte{IAC, Reversed[operation], option}
+		return
+	}
+
+	if local {
+		per = &op.local
+	} else {
+		per = &op.remote
+	}
+
+	if per.enabled {
+		if !enabler {
+			per.enabled = false
+			if local {
+				t.onDisableLocal(option)
+			} else {
+				t.onDisableRemote(option)
+			}
 		}
 		return
 	}
 
-	h.previous = make([]byte, 0)
-	copy(data, h.previous)
+	if per.negotiating {
+		// We were already negotiating, and just got confirmation.
+		per.enabled = true
+		per.negotiating = false
+		if local {
+			t.onEnableLocal(option)
+		} else {
+			t.onEnableRemote(option)
+		}
+	} else {
+		// Time to start negotiation.
+		per.negotiating = true
+		t.outchan <- []byte{IAC, Negotiators[operation], option}
+	}
 
-	if data[0] != 0 {
-		// this is malformed data. discarding.
+}
+
+var mtts_sequence = []byte{IAC, SB, MTTS, 1, IAC, SE}
+
+func (t *TelnetStream) handleMTTS(p []byte) {
+	if t.mtts_temp == nil {
+		t.mtts_temp = make([]byte, 0)
+		t.mtts_state = 0
+	}
+
+	if bytes.Equal(p, t.mtts_temp) {
+		// The client has stopped sending unique data. Ignore.
 		return
 	}
 
-	msg := data[1:]
+	t.mtts_temp = make([]byte, 0)
+	copy(p, t.mtts_temp)
+
+	if p[0] != 0 {
+		// malformed data, discard
+		return
+	}
+
+	msg := p[1:]
 	if len(msg) == 0 {
-		// no message to do anything with.
+		// no message to parse.
 		return
 	}
 
 	info := string(msg)
-	fmt.Println("TTYPE Info ", h.state, " IS: ", info)
+	fmt.Println("MTTS STATE", t.mtts_state, ":", info)
 
-	switch h.state {
+	switch t.mtts_state {
 	case 0:
-		h.receive_stage_0(t, info)
-		h.state = 1
-		h.OnRemoteEnable(t)
-		delete(t.hs.special, 0)
+		t.handleMTTS_0(info)
 	case 1:
-		h.receive_stage_1(t, info)
-		h.state = 2
-		h.OnRemoteEnable(t)
-		delete(t.hs.special, 1)
+		t.handleMTTS_1(info)
 	case 2:
-		h.receive_stage_2(t, info)
-		h.state = 3
-		delete(t.hs.special, 2)
+		t.handleMTTS_2(info)
 	}
-	if !t.ready {
-		t.CheckReady()
-	}
-
-	if t.ready {
-		t.OnUpdate()
+	t.mtts_state += 1
+	if t.mtts_state < 3 {
+		t.outchan <- mtts_sequence
 	}
 }
 
-func (h *TTYPEHandler) receive_stage_0(t *TelnetMudConnection, info string) {
+func (t *TelnetStream) handleMTTS_0(info string) {
 	client_name := strings.ToUpper(info)
 	client_ver := ""
 	if strings.Contains(client_name, " ") {
@@ -296,25 +478,25 @@ func (h *TTYPEHandler) receive_stage_0(t *TelnetMudConnection, info string) {
 	}
 
 	if strings.HasPrefix(client_name, "XTERM") || strings.HasSuffix(client_name, "-256COLOR") || XTERM_CLIENTS[client_name] {
-		t.capabilities.Xterm256 = true
+		t.capabilities.Color = uint8(math.Max(float64(t.capabilities.Color), 2))
 	}
 
-	t.capabilities.Ansi = true
-
+	t.capabilities.Color = uint8(math.Max(float64(t.capabilities.Color), 1))
+	t.dirty = true
 }
 
-func (h *TTYPEHandler) receive_stage_1(t *TelnetMudConnection, info string) {
+func (t *TelnetStream) handleMTTS_1(info string) {
 	tupper := strings.ToUpper(info)
 	xterm := (strings.HasSuffix(tupper, "-256COLOR") || strings.HasSuffix(tupper, "XTERM")) && !strings.HasSuffix(tupper, "-COLOR")
 
 	if xterm {
-		t.capabilities.Ansi = true
-		t.capabilities.Xterm256 = true
+		t.capabilities.Color = uint8(math.Max(float64(t.capabilities.Color), 2))
 	}
 	t.capabilities.Terminal_type = tupper
+	t.dirty = true
 }
 
-func (h *TTYPEHandler) receive_stage_2(t *TelnetMudConnection, info string) {
+func (t *TelnetStream) handleMTTS_2(info string) {
 	data := strings.ToUpper(info)
 	if !strings.HasPrefix(data, "MTTS") {
 		return
@@ -341,7 +523,7 @@ func (h *TTYPEHandler) receive_stage_2(t *TelnetMudConnection, info string) {
 	}
 
 	if (mask & 8) == 8 {
-		t.capabilities.Xterm256 = true
+		t.capabilities.Color = uint8(math.Max(float64(t.capabilities.Color), 2))
 	}
 
 	if (mask & 4) == 4 {
@@ -353,451 +535,150 @@ func (h *TTYPEHandler) receive_stage_2(t *TelnetMudConnection, info string) {
 	}
 
 	if (mask & 1) == 1 {
-		t.capabilities.Ansi = true
+		t.capabilities.Color = uint8(math.Max(float64(t.capabilities.Color), 1))
 	}
+	t.dirty = true
 }
 
-type OutMessage struct {
-	close bool
-	mccp2 bool
-	data  []byte
-}
-
-type OpPerspective struct {
-	enabled     bool
-	negotiating bool
-	asked       bool
-	answered    bool
-}
-
-type OpState struct {
-	local  OpPerspective
-	remote OpPerspective
-}
-
-type HandShakes struct {
-	local   map[byte]bool
-	remote  map[byte]bool
-	special map[byte]bool
-}
-
-func (h *HandShakes) Init() {
-	h.local = make(map[byte]bool)
-	h.remote = make(map[byte]bool)
-	h.special = make(map[byte]bool)
-}
-
-func (h *HandShakes) IsEmpty() bool {
-	return (len(h.local) + len(h.remote) + len(h.special)) == 0
-}
-
-func (h *HandShakes) Clear() {
-	h.Init()
-}
-
-func (h *HandShakes) OnLocal(t *TelnetMudConnection, b byte) {
-	delete(h.local, b)
-	if h.IsEmpty() {
-		t.CheckReady()
-	}
-}
-
-func (h *HandShakes) OnRemote(t *TelnetMudConnection, b byte) {
-	delete(h.remote, b)
-	if h.IsEmpty() {
-		t.CheckReady()
-	}
-}
-
-func (h *HandShakes) OnSpecial(t *TelnetMudConnection, b byte) {
-	delete(h.special, b)
-	if h.IsEmpty() {
-		t.CheckReady()
-	}
-}
-
-type TelnetMudConnection struct {
-	name         string
-	conn         net.Conn
-	listener     *TelnetMudListener
-	manager      *mudlink.MudLinkManager
-	ready        bool
-	handlers     map[byte]OpHandler
-	states       map[byte]OpState
-	hs           HandShakes
-	outbox       chan *OutMessage
-	inbox        *bytes.Buffer
-	cmdbox       *bytes.Buffer
-	pending_cmds []string
-	running      bool
-	capabilities mudlink.MudCapabilities
-}
-
-func (t *TelnetMudConnection) Init() {
-	t.outbox = make(chan *OutMessage, 20)
-	t.handlers = make(map[byte]OpHandler)
-	t.states = make(map[byte]OpState)
-	t.inbox = bytes.NewBuffer(nil)
-	t.cmdbox = bytes.NewBuffer(nil)
-	t.pending_cmds = make([]string, 0)
-	t.hs.Init()
-	t.capabilities.Protocol = "telnet"
-	t.capabilities.Address = t.conn.RemoteAddr()
-	if t.listener.tls != nil {
-		t.capabilities.Tls = true
-	}
-
-	t.handlers[NAWS] = &NAWSHandler{}
-	t.handlers[TTYPE] = &TTYPEHandler{}
-	t.handlers[LINEMODE] = &LinemodeHandler{}
-	t.handlers[SGA] = &SGAHandler{}
-	t.handlers[MSSP] = &MSSPHandler{}
-
-	for key, _ := range t.handlers {
-		t.states[key] = OpState{}
-	}
-
-	for _, val := range t.handlers {
-		val.Init(t)
-		val.RegisterHandshakes(t)
-	}
-
-	for k, v := range t.handlers {
-		if v.StartDo() {
-			t.outbox <- &OutMessage{data: []byte{IAC, DO, k}}
+func (t *TelnetStream) handleSub(option byte, p []byte) {
+	fmt.Println("HANDLE SUB:", option, ":", string(p))
+	switch option {
+	case NAWS:
+		if len(p) == 4 {
+			t.capabilities.Width = binary.BigEndian.Uint16(p[:2])
+			t.capabilities.Height = binary.BigEndian.Uint16(p[3:])
+			t.dirty = true
 		}
-		if v.StartWill() {
-			t.outbox <- &OutMessage{data: []byte{IAC, WILL, k}}
-		}
+	case MTTS:
+		t.handleMTTS(p)
 	}
-
 }
 
-func (t *TelnetMudConnection) Capabilities() *mudlink.MudCapabilities {
-	return &t.capabilities
+func (t *TelnetStream) handleCommand(command byte) {
+	// for now, this does absolutely nothing.
+	fmt.Println("TEST COMMAND:", command)
 }
 
-func (t *TelnetMudConnection) Ready() bool {
-	return t.ready
-}
-
-func (t *TelnetMudConnection) CheckReady() {
-	if t.ready {
-		return
-	}
-	if !t.hs.IsEmpty() {
-		return
-	}
-	go t.FinishNegotiation()
-}
-
-func (t *TelnetMudConnection) FinishNegotiation() {
-	if t.ready {
+func (t *TelnetStream) handleTelnetMessage(p []byte) {
+	fmt.Println("GOT TELNET MESSAGE: ", p)
+	if len(p) == 1 {
+		// This can only be appdata - it's either a random character, or an escaped IAC.
+		t.handleAppData(p)
 		return
 	}
 
-	t.ready = true
-	t.manager.Handler.OnConnect(t)
-	// if any commands have built up before negotiation finished, they're sent now.
-	for _, c := range t.pending_cmds {
-		t.manager.Handler.OnLine(t, c)
-	}
-}
-
-func (t *TelnetMudConnection) RunTimer() {
-	// This should be ample time for Telnet negotiation to complete.
-	time.Sleep(time.Millisecond * 300)
-	t.FinishNegotiation()
-}
-
-func (t *TelnetMudConnection) RunKeepalive() {
-	for t.running == true {
-		time.Sleep(time.Second * 20)
-		if t.capabilities.Keepalive {
-			t.outbox <- &OutMessage{data: []byte{IAC, NOP}}
+	if p[0] == IAC {
+		// determine the nature of the message next. This is an IAC sequence after all.
+		_, ok := Negotiators[p[1]]
+		switch {
+		case ok:
+			t.handleNegotiate(p[1], p[2])
+		case p[1] == SB:
+			t.handleSub(p[2], p[3:len(p)-2])
+		default:
+			t.handleCommand(p[2])
 		}
+	} else {
+		// This is appdata.
+		t.handleAppData(p)
 	}
+
 }
 
-func (t *TelnetMudConnection) RunOutBox() {
-	for msg := range t.outbox {
-		if !t.running {
-			// if we're not running anymore, then terminate.
-			return
-		}
-		written, err := t.conn.Write(msg.data)
+func (t *TelnetStream) runReader() {
+	//orig := t.reader
+	var inbuf bytes.Buffer
+	zcom, _ := zlib.NewReader(&inbuf)
+	zreader := bufio.NewReader(zcom)
+	var zbuf bytes.Buffer
+
+	for {
+		tbuf := make([]byte, 2048)
+		num, err := t.reader.Read(tbuf)
+		fmt.Println("Read ", num, " bytes", tbuf[:num])
 		if err != nil {
-			fmt.Println("Error on: ", t.name, ": ", err.Error())
-			fmt.Println("Okay something went wrong here... only wrote: ", written)
+			// gotta do something with this error.
 		}
-	}
-}
+		inbuf.Write(tbuf[:num])
+		var buf *bytes.Buffer = nil
 
-func (t *TelnetMudConnection) RunInbox() {
-	buff := make([]byte, 256)
-	for t.running == true {
-		count, err := t.conn.Read(buff)
-		if count > 0 {
-			t.inbox.Write(buff[:count])
-			t.ParseTelnet()
-		}
-		if err == io.EOF {
-			t.running = false
-			close(t.outbox)
-			t.manager.Handler.OnDisconnect(t)
-		}
-	}
-}
-
-func (t *TelnetMudConnection) ParseTelnet() {
-	for t.inbox.Len() > 0 {
-		data := t.inbox.Bytes()
-
-		if data[0] == IAC {
-			if t.inbox.Len() < 2 {
-				// There is nothing more we can do with only 1 byte as an IAC.
-				return
-			}
-
-			// WILL, WONT, DO, or DONT as the second byte means this is a negotiation.
-			if data[1] == WILL || data[1] == WONT || data[1] == DO || data[1] == DONT {
-				if t.inbox.Len() >= 3 {
-					neg := t.inbox.Next(3)
-					t.Negotiate(neg[1], neg[2])
-					continue
-				} else {
-					// need more data to process a negotiation.
-					return
-				}
-			}
-
-			// second byte SB means this is a subnegotiation.
-			if data[1] == SB {
-				if t.inbox.Len() >= 5 {
-					indx := bytes.Index(data, []byte{IAC, SE})
-					if indx != -1 {
-						subneg := t.inbox.Next(indx + 1)
-						t.SubNegotiate(subneg[2], subneg[3:indx])
-						continue
-					} else {
-						// subnegotiation unfinished.
-						return
-					}
-				} else {
-					// need more data to process a sub-negotiation.
-					return
-				}
-			}
-
-			// this is an escaped IAC - just pass it along.
-			if data[1] == IAC {
-				t.cmdbox.WriteByte(IAC)
-				t.inbox.Next(2)
-				t.ParseAppData()
-				continue
-			} else {
-				// and if it's anything else, pass it to DoAppCmd.
-				discarded := t.inbox.Next(2)
-				t.DoAppCmd(discarded[1])
-				continue
-			}
-
+		if t.capabilities.Mccp3_active {
+			buf = &zbuf
+			zreader.WriteTo(buf)
 		} else {
-			// We are not looking at an IAC. look ahead until we see one and delim there.
-			idx := bytes.IndexByte(data, IAC)
-			if idx != -1 {
-				t.cmdbox.Write(t.inbox.Next(idx))
-				t.ParseAppData()
-				continue
-			} else {
-				// If there was no IAC, then append EVERYTHING to the cmdbox.
-				t.cmdbox.Write(t.inbox.Next(t.inbox.Len()))
-				t.ParseAppData()
-				return
+			buf = &inbuf
+		}
+
+		for {
+			consumed, data, _ := TelnetSplit(buf.Bytes(), false)
+
+			if data == nil {
+				break
 			}
+			fmt.Println("Consumed", consumed, "bytes:", data)
+			buf.Next(consumed)
 
+			t.handleTelnetMessage(data)
+			if !t.capabilities.Mccp3_active && bytes.Equal(mccp3_sequence, data) {
+				t.capabilities.Mccp3_active = true
+				t.dirty = true
+				buf = &zbuf
+				zreader.WriteTo(buf)
+			}
 		}
 	}
 }
 
-func (t *TelnetMudConnection) OnUpdate() {
-	if t.ready {
-		t.manager.Handler.OnUpdate(t)
-	}
-}
+func (t *TelnetStream) runWriter() {
+	var outbuf bytes.Buffer
+	// Storing this in case we need to replace it.
+	orig := t.writer
+	var zwriter *zlib.Writer = nil
 
-func (t *TelnetMudConnection) DoAppCmd(command byte) {
-	// these are pretty much ignored for the moment.
-}
+	for data := range t.outchan {
+		outbuf.Write(data)
+		fmt.Println("Flushing to outbuf:", data)
 
-func (t *TelnetMudConnection) Negotiate(command, option byte) {
-	handler, found := t.handlers[option]
-	if !found {
-		switch command {
-		case WILL:
-			t.outbox <- &OutMessage{data: []byte{IAC, DONT, option}}
-		case DO:
-			t.outbox <- &OutMessage{data: []byte{IAC, WONT, option}}
-		}
-		return
-	}
-	state, found2 := t.states[option]
-	if !found2 {
-		return
-	}
-
-	switch command {
-	case WILL:
-		if handler.SupportRemote() {
-			if state.remote.negotiating {
-				state.remote.negotiating = false
-				if !state.remote.enabled {
-					state.remote.enabled = true
-					handler.OnRemoteEnable(t)
-					if !state.remote.answered {
-						state.remote.answered = true
-						t.hs.OnRemote(t, option)
+		for outbuf.Len() > 0 {
+			written, err := t.writer.Write(outbuf.Bytes())
+			if written > 0 {
+				outbuf.Next(written)
+				if t.capabilities.Mccp2_active {
+					err := zwriter.Flush()
+					if err != nil {
+						// do something with this...
 					}
 				}
-			} else {
-				state.remote.enabled = true
-				t.outbox <- &OutMessage{data: []byte{IAC, DO, option}}
-				handler.OnRemoteEnable(t)
-				if !state.remote.answered {
-					state.remote.answered = true
-					t.hs.OnRemote(t, option)
-				}
 			}
-		} else {
-			t.outbox <- &OutMessage{data: []byte{IAC, DONT, option}}
-		}
-
-	case DO:
-		if handler.SupportLocal() {
-			if state.local.negotiating {
-				state.local.negotiating = false
-				if !state.local.enabled {
-					state.local.enabled = true
-					handler.OnLocalEnable(t)
-					if !state.local.answered {
-						state.local.answered = true
-						t.hs.OnLocal(t, option)
-					}
-				}
-			} else {
-				state.local.enabled = true
-				t.outbox <- &OutMessage{data: []byte{IAC, DO, option}}
-				handler.OnLocalEnable(t)
-				if !state.local.answered {
-					state.local.answered = true
-					t.hs.OnLocal(t, option)
-				}
-			}
-		} else {
-			t.outbox <- &OutMessage{data: []byte{IAC, WONT, option}}
-		}
-
-	case WONT:
-		if state.remote.enabled {
-			handler.OnRemoteDisable(t)
-			state.remote.enabled = false
-		}
-		if state.remote.negotiating {
-			state.remote.negotiating = false
-			if !state.remote.answered {
-				state.remote.answered = true
-				t.hs.OnRemote(t, option)
+			if err != nil {
+				// Do something with the error..
 			}
 		}
 
-	case DONT:
-		if state.local.enabled {
-			handler.OnLocalDisable(t)
-			state.local.enabled = false
-		}
-		if state.local.negotiating {
-			state.local.negotiating = false
-			if !state.local.answered {
-				state.local.answered = true
-				t.hs.OnLocal(t, option)
-			}
-		}
-	}
-
-}
-
-func (t *TelnetMudConnection) SubNegotiate(option byte, data []byte) {
-	handler, exists := t.handlers[option]
-	if exists {
-		handler.SubNegotiate(t, data)
-	}
-}
-
-func (t *TelnetMudConnection) ParseAppData() {
-	for t.cmdbox.Len() > 0 {
-		data := t.cmdbox.Bytes()
-		idx := bytes.IndexByte(data, LF)
-		if idx != -1 {
-			// we have a line! Error cannot occur in this situation so ignoring it.
-			line, _ := t.cmdbox.ReadBytes(LF)
-			if t.ready {
-				t.HandleLine(bytes.TrimSpace(line))
-			} else {
-				t.SuspendLine(bytes.TrimSpace(line))
-			}
-		} else {
-			// no lines to process...
-			return
+		// if we just sent a mccp2_sequence, enable compression if it isn't already enabled.
+		if !t.capabilities.Mccp2_active && bytes.Equal(data, mccp2_sequence) {
+			// Enable MCCP2 outgoing compression.
+			t.capabilities.Mccp2_active = true
+			fmt.Println("MCCP2 FULLY ACTIVATED")
+			t.dirty = true
+			zwriter = zlib.NewWriter(orig)
+			t.writer = zwriter
 		}
 	}
 }
 
-func (t *TelnetMudConnection) HandleLine(line []byte) {
-	if utf8.Valid(line) {
-		t.manager.Handler.OnLine(t, string(line))
-	}
-}
+func NewTelnetStream(reader io.Reader, writer io.WriteCloser) *TelnetStream {
+	t := new(TelnetStream)
+	t.reader = reader
+	t.writer = writer
+	t.capabilities.Protocol = mudlink.Telnet
+	t.capabilities.Client_name = "UNKNOWN"
+	t.capabilities.Client_version = "UNKNOWN"
+	t.capabilities.Width = 78
+	t.capabilities.Height = 24
+	t.outchan = make(chan []byte, 10)
 
-func (t *TelnetMudConnection) SuspendLine(line []byte) {
-	if utf8.Valid(line) {
-		t.pending_cmds = append(t.pending_cmds, string(line))
-	}
-}
-
-func (t *TelnetMudConnection) Start() {
-	t.running = true
-	go t.RunTimer()
-	go t.RunKeepalive()
-	go t.RunOutBox()
-	go t.RunInbox()
-}
-
-func (t *TelnetMudConnection) Stop() {
-
-}
-
-func (t *TelnetMudConnection) Name() string {
-	return t.name
-}
-
-func (t *TelnetMudConnection) Close() {
-
-}
-
-func (t *TelnetMudConnection) SendStatus(data map[string]string) {
-
-}
-
-func (t *TelnetMudConnection) SendLine(data string) {
-
-}
-
-func (t *TelnetMudConnection) SendText(data string) {
-
-}
-
-func (t *TelnetMudConnection) SendPrompt(data string) {
-
+	return t
 }
 
 type TelnetMudListener struct {
@@ -812,14 +693,18 @@ func (t *TelnetMudListener) RunLoop() {
 	for t.running == true {
 		c, err := t.listener.Accept()
 		if err != nil {
-			fmt.Println("Error, ", err.Error())
+			fmt.Println("Error:", err.Error())
 			t.running = false
 			return
 		}
 		name := t.manager.GenerateConnId(t.name, 20)
-		tmp := TelnetMudConnection{name: name, conn: c, manager: t.manager, listener: t}
-		tmp.Init()
-		t.manager.RegisterConnection(&tmp)
+		tmp := NewTelnetStream(c, c)
+		tmp.capabilities.ClientID = name
+		tmp.capabilities.Address = c.RemoteAddr()
+		if t.tls != nil {
+			tmp.capabilities.Tls = true
+		}
+		t.manager.RegisterConnection(tmp)
 	}
 }
 
