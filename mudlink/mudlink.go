@@ -2,6 +2,7 @@ package mudlink
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"net"
 	"time"
@@ -68,6 +69,7 @@ type MudConnection interface {
 	SendText(data string)
 	SendPrompt(data string)
 	Status() uint8
+	SetManager(m *MudLinkManager)
 }
 
 type MudListener interface {
@@ -91,6 +93,8 @@ type MudLinkManager struct {
 	listeners   map[string]MudListener
 	Connections map[string]MudConnection
 	Handler     MudConnectionHandler
+	Outchan     chan json.RawMessage
+	Inchan      chan json.RawMessage
 }
 
 func NewMudLinkManager(h MudConnectionHandler) (*MudLinkManager, error) {

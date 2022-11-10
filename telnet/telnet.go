@@ -6,6 +6,7 @@ import (
 	"compress/zlib"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/Masterminds/semver"
 	"github.com/volundmush/mudlink-go/mudlink"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var XTERM_CLIENTS = map[string]bool{"ATLANTIS": true, "CMUD": true, "KILDCLIENT": true, "MUDLET": true, "MUSHCLIENT": true,
@@ -151,8 +153,8 @@ type TelnetOption struct {
 type TelnetStream struct {
 	reader       io.Reader
 	writer       io.WriteCloser
-	address      net.Addr
 	outchan      chan []byte
+	inchan       chan []byte
 	appdata      bytes.Buffer
 	op_sga       TelnetOption
 	op_telopteor TelnetOption
@@ -173,6 +175,7 @@ type TelnetStream struct {
 	mtts_state   uint8
 	capabilities mudlink.MudCapabilities
 	status       uint8
+	manager      *mudlink.MudLinkManager
 }
 
 var mccp2_sequence = []byte{IAC, SB, MCCP2, IAC, SE}
@@ -204,18 +207,101 @@ func (t *TelnetStream) Start() {
 	t.op_mxp.local.negotiating = true
 	go t.runWriter()
 	go t.runReader()
+	go t.runGetReady()
 }
 
 func (t *TelnetStream) Close() {
 	close(t.outchan)
+	close(t.inchan)
 	t.writer.Close()
 }
 
-func (t *TelnetStream) handleAppData(p []byte) {
-	t.appdata.Write(p)
-	fmt.Println("GOT APPDATA:", string(p))
-	t.SendLine("ECHO: " + string(p))
+func (t *TelnetStream) getReady() {
+	t.status = mudlink.Running
+	if t.manager != nil {
+		j, err := json.Marshal(map[string]interface{}{
+			"MsgType":      "ClientReady",
+			"ClientID":     t.capabilities.ClientID,
+			"Capabilities": t.capabilities,
+		})
+		if err != nil {
+			// handle error somehow.
+		}
+		t.manager.Outchan <- j
+	}
 
+	// TODO: make it send a Ready message.
+
+	// This will force handleAppData to flush itself now
+	// that we're ready.
+	t.handleAppData(make([]byte, 0))
+}
+
+func (t *TelnetStream) runGetReady() {
+	ops := []*TelnetOption{&t.op_sga, &t.op_telopteor, &t.op_naws, &t.op_mnes,
+		&t.op_mxp, &t.op_mssp, &t.op_mccp2, &t.op_mccp3, &t.op_gmcp, &t.op_msdp,
+		&t.op_mtts}
+
+	tries := 0
+	for range time.NewTicker(time.Millisecond * 30).C {
+		tries++
+		if tries > 10 {
+			break
+		}
+		pending := false
+		for _, cur := range ops {
+			if cur.local.negotiating || cur.remote.negotiating {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			t.getReady()
+			break
+		}
+	}
+	// Negotiation timed out...
+	t.getReady()
+}
+
+func (t *TelnetStream) handleAppData(p []byte) {
+	t.inchan <- p
+}
+
+var delim = []byte{LF}
+
+func (t *TelnetStream) runAppData() {
+	for data := range t.inchan {
+		t.appdata.Write(data)
+
+		if t.status != mudlink.Running {
+			continue
+		}
+
+		if t.dirty {
+			// generate a new status update.
+			// send it here.
+			t.dirty = false
+		}
+
+		// now gather newlines from t.appdata until none remain
+		for bytes.Contains(t.appdata.Bytes(), delim) {
+			b, _ := t.appdata.ReadString(LF)
+			b = strings.ReplaceAll(b, "\r", "")
+			fmt.Println("COMMAND:", b)
+			if t.manager != nil {
+				j, err := json.Marshal(map[string]interface{}{
+					"MsgType":  "ClientCommand",
+					"ClientID": t.capabilities.ClientID,
+					"Command":  b,
+				})
+				if err != nil {
+					// do something with this error.
+				}
+				t.manager.Outchan <- j
+			}
+		}
+	}
 }
 
 func (t *TelnetStream) Capabilities() *mudlink.MudCapabilities {
@@ -291,6 +377,7 @@ func (t *TelnetStream) onEnableRemote(option byte) {
 		t.capabilities.Naws = true
 	case MTTS:
 		t.capabilities.Mtts = true
+		t.outchan <- mtts_sequence
 	case MCCP3:
 		t.capabilities.Mccp3 = true
 	}
@@ -677,6 +764,7 @@ func NewTelnetStream(reader io.Reader, writer io.WriteCloser) *TelnetStream {
 	t.capabilities.Width = 78
 	t.capabilities.Height = 24
 	t.outchan = make(chan []byte, 10)
+	t.inchan = make(chan []byte, 10)
 
 	return t
 }
